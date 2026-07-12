@@ -271,3 +271,41 @@ def compute_gene_identity_baseline(feature_df: pd.DataFrame, n_splits: int = 5, 
     r2 = r2_score(y, preds)
     rho, pval = spearmanr(y, preds)
     return {"r2": r2, "spearman_r": rho, "spearman_p": pval}
+
+
+def train_and_evaluate_with_gene_baseline(feature_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42) -> Dict:
+    """
+    The fairest, most complete test: combines the multi-omic features WITH
+    each kinase's own typical dependency level (computed ONLY from the
+    training folds' cell lines, never the held-out ones, so this is not
+    leakage) as an additional feature. Tests whether expression/CNV/
+    mutation explain any variance BEYOND each gene's usual baseline
+    essentiality, which compute_gene_identity_baseline() alone cannot
+    answer (it only tests the baseline in isolation).
+    """
+    feature_cols = [c for c in feature_df.columns if c not in ("cell_line_id", "kinase_id", "dependency_prob")]
+    groups = feature_df["cell_line_id"].values
+    y = feature_df["dependency_prob"].values
+    kinase_ids = feature_df["kinase_id"].values
+
+    n_groups = feature_df["cell_line_id"].nunique()
+    actual_splits = min(n_splits, n_groups)
+    gkf = GroupKFold(n_splits=actual_splits)
+
+    preds = np.zeros(len(feature_df))
+    for train_idx, test_idx in gkf.split(feature_df, groups=groups):
+        train_gene_means = pd.Series(y[train_idx]).groupby(kinase_ids[train_idx]).mean()
+        overall_mean = y[train_idx].mean()
+        gene_baseline_train = np.array([train_gene_means.get(k, overall_mean) for k in kinase_ids[train_idx]])
+        gene_baseline_test = np.array([train_gene_means.get(k, overall_mean) for k in kinase_ids[test_idx]])
+
+        X_train = np.column_stack([feature_df[feature_cols].values[train_idx], gene_baseline_train])
+        X_test = np.column_stack([feature_df[feature_cols].values[test_idx], gene_baseline_test])
+
+        model = GradientBoostingRegressor(random_state=random_state, n_estimators=150, max_depth=3, learning_rate=0.05)
+        model.fit(X_train, y[train_idx])
+        preds[test_idx] = model.predict(X_test)
+
+    r2 = r2_score(y, preds)
+    rho, pval = spearmanr(y, preds)
+    return {"r2": r2, "spearman_r": rho, "spearman_p": pval, "feature_names": feature_cols + ["gene_baseline"]}
