@@ -229,3 +229,45 @@ def _run_smoke_test():
 
 if __name__ == "__main__":
     _run_smoke_test()
+
+
+# =====================================================================
+# 4. GENE-IDENTITY BASELINE DIAGNOSTIC
+# =====================================================================
+
+def compute_gene_identity_baseline(feature_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42) -> Dict:
+    """
+    Diagnostic: how much of the variance in dependency_prob is explained
+    simply by "which kinase is this" (each kinase's own mean dependency
+    across cell lines), independent of expression/CNV/mutation?
+
+    Uses the SAME GroupKFold-by-cell-line scheme as train_and_evaluate()
+    for a fair comparison: for each held-out fold of cell lines, predicts
+    each row's dependency as that KINASE's mean dependency computed from
+    the OTHER (training) cell lines only -- no leakage from the held-out
+    cell lines' own values.
+
+    This is not a model you'd deploy -- it's a diagnostic to tell you
+    whether gene identity/baseline essentiality dominates the signal
+    (high R^2 here, with little added by expression/CNV) or whether
+    per-sample multi-omic features are what actually matter (low R^2
+    here, meaning train_and_evaluate()'s real feature-based model is
+    doing the real work).
+    """
+    groups = feature_df["cell_line_id"].values
+    y = feature_df["dependency_prob"].values
+    kinase_ids = feature_df["kinase_id"].values
+
+    n_groups = feature_df["cell_line_id"].nunique()
+    actual_splits = min(n_splits, n_groups)
+    gkf = GroupKFold(n_splits=actual_splits)
+
+    preds = np.zeros(len(feature_df))
+    for train_idx, test_idx in gkf.split(feature_df, groups=groups):
+        train_means = pd.Series(y[train_idx]).groupby(kinase_ids[train_idx]).mean()
+        overall_mean = y[train_idx].mean()  # fallback for any kinase not seen in this fold's training split
+        preds[test_idx] = [train_means.get(k, overall_mean) for k in kinase_ids[test_idx]]
+
+    r2 = r2_score(y, preds)
+    rho, pval = spearmanr(y, preds)
+    return {"r2": r2, "spearman_r": rho, "spearman_p": pval}
