@@ -49,6 +49,7 @@ def build_feature_matrix(
     mutation_df: pd.DataFrame,
     dependency_df: pd.DataFrame,
     subtype_df: Optional[pd.DataFrame] = None,
+    pan_essential_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Each *_df input is the tidy long-format output of the corresponding
@@ -56,12 +57,23 @@ def build_feature_matrix(
     <value>), except subtype_df, which is the raw wide DataFrame from
     parse_depmap_subtype_matrix() (indexed by cell_line_id / ModelID).
 
+    pan_essential_df: the output of
+    depmap_supplemental_loader.flag_pan_essential_kinases() (columns:
+    kinase_id, is_pan_essential). IMPORTANT -- without this, the model has
+    NO gene-identity signal at all: it only sees per-sample expression/
+    CNV/mutation values, with no way to know "this gene tends to be
+    essential regardless of those values" (a real, likely substantial
+    source of learnable structure for the many kinases that are broadly
+    essential across cell lines, independent of their expression level in
+    any specific line). Strongly recommended to pass this.
+
     Returns one row per (cell_line_id, kinase_id) with columns:
-    log_tpm, log2_cn, damaging_mutation, dependency_prob (the prediction
-    target), plus one column per subtype category if subtype_df is given.
-    Rows with a missing target (dependency_prob) are dropped -- you can't
-    train or evaluate against a label that doesn't exist, unlike CTS's
-    missing-value policy which is about INPUT features, not the label.
+    log_tpm, log2_cn, damaging_mutation, is_pan_essential (if provided),
+    dependency_prob (the prediction target), plus one column per subtype
+    category if subtype_df is given. Rows with a missing target
+    (dependency_prob) are dropped -- you can't train or evaluate against
+    a label that doesn't exist, unlike CTS's missing-value policy which is
+    about INPUT features, not the label.
     """
     merged = dependency_df[["cell_line_id", "kinase_id", "dependency_prob"]].merge(
         expression_df[["cell_line_id", "kinase_id", "log_tpm"]],
@@ -73,6 +85,12 @@ def build_feature_matrix(
         mutation_df[["cell_line_id", "kinase_id", "damaging_mutation"]],
         on=["cell_line_id", "kinase_id"], how="left",
     )
+
+    if pan_essential_df is not None:
+        merged = merged.merge(
+            pan_essential_df[["kinase_id", "is_pan_essential"]], on="kinase_id", how="left",
+        )
+        merged["is_pan_essential"] = merged["is_pan_essential"].fillna(False).astype(int)
 
     if subtype_df is not None:
         merged = merged.merge(
