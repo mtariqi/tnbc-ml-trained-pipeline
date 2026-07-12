@@ -41,8 +41,11 @@ def parse_depmap_hotspot_mutations(csv_path: str, genes: List[str], cell_line_id
     hotspot (activating) mutation, as distinct from the Damaging matrix's
     loss-of-function signal. Important for your kinase panel specifically,
     since these are almost all proto-oncogenes where activation (not loss)
-    is the relevant event."""
-    return parse_depmap_wide_matrix(csv_path, genes, cell_line_ids, value_name="hotspot_mutation")
+    is the relevant event. Same confirmed structure as the Damaging matrix
+    (ModelID as a named column, not the index) -- see
+    depmap_multiomic_loader.parse_depmap_mutation_matrix()."""
+    from depmap_multiomic_loader import parse_depmap_mutation_matrix
+    return parse_depmap_mutation_matrix(csv_path, genes, cell_line_ids, value_name="hotspot_mutation")
 
 
 # =====================================================================
@@ -104,10 +107,13 @@ def parse_gene_fusions(csv_path: str, target_genes: List[str], cell_line_ids: Op
     """
     OmicsFusionFiltered.csv -- filters to fusion events involving any gene
     in `target_genes` (pass your 90 kinases; fusions are especially
-    relevant for NTRK1/2/3, ALK, ROS1, RET specifically). Column names for
-    the two fusion partners are auto-detected from common DepMap
-    conventions (LeftGene/RightGene, Gene1/Gene2, FusionName parsing) --
-    PRINTS what it found so you can confirm it guessed correctly.
+    relevant for NTRK1/2/3, ALK, ROS1, RET specifically).
+
+    CONFIRMED real format (verified against the actual file): columns are
+    'Gene1'/'Gene2', with values like 'RARG (ENSG00000172819.17)' -- a
+    gene symbol PLUS an Ensembl ID suffix, not a bare symbol. This
+    function strips that suffix before matching against target_genes;
+    without it, every comparison would silently fail to match anything.
     """
     df = pd.read_csv(csv_path)
     print(f"Columns found in {csv_path}: {df.columns.tolist()}")
@@ -122,13 +128,31 @@ def parse_gene_fusions(csv_path: str, target_genes: List[str], cell_line_ids: Op
               "Inspect the printed column list above and adapt this function manually.")
         return pd.DataFrame()
 
+    if "IsDefaultEntryForModel" in df.columns:
+        before = len(df)
+        df = df[df["IsDefaultEntryForModel"] == "Yes"]
+        if len(df) < before:
+            print(f"Filtered to IsDefaultEntryForModel=='Yes': {before} -> {len(df)} rows.")
+
     if cell_line_ids is not None and model_col:
         df = df[df[model_col].isin(cell_line_ids)]
 
+    # Strip the '(ENSEMBL_ID.version)' suffix from each gene-partner column
+    # before matching -- confirmed necessary against the real file, where
+    # raw values look like 'RARG (ENSG00000172819.17)', not 'RARG'.
+    stripped_cols = {}
+    for col in gene_cols:
+        stripped_cols[col] = df[col].astype(str).str.split(" (", regex=False).str[0]
+
     mask = False
     for col in gene_cols:
-        mask = mask | df[col].isin(target_genes)
+        mask = mask | stripped_cols[col].isin(target_genes)
     hits = df[mask].copy()
+
+    # Add clean (suffix-stripped) versions of the gene columns alongside the
+    # raw ones, so results are readable without the Ensembl ID clutter.
+    for col in gene_cols:
+        hits[f"{col}_clean"] = stripped_cols[col][mask]
 
     print(f"Found {len(hits)} fusion event(s) involving one of your {len(target_genes)} target genes, "
           f"out of {len(df)} total fusion records{' in your cell-line subset' if cell_line_ids else ''}.")
@@ -155,12 +179,31 @@ def validate_tnbc_subtype_labels(
     your_tnbc_model_ids: List[str],
 ) -> pd.DataFrame:
     """
-    Cross-checks your manually-curated TNBC cell-line list (from
-    ModelSubtypeFeatures string-matching, done earlier) against DepMap's
-    own inferred molecular subtype calls. Returns a DataFrame flagging any
-    disagreement -- a cell line you called TNBC that DepMap's own subtype
-    inference does NOT confirm, or vice versa, is worth a manual look
-    rather than silently trusting either source alone.
+    ORIGINALLY INTENDED to cross-check your manually-curated TNBC cell-line
+    list against a general DepMap subtype/lineage inference file.
+
+    CORRECTION, confirmed against the real file: OmicsInferredMolecularSubtypes.csv
+    is NOT a general subtype/lineage classifier. Its actual columns are
+    specific, individually-named druggable hotspot mutations across ALL
+    cancer types (e.g. 'KRAS p.G12D', 'BRAF p.V600E', 'EGFR p.L858R',
+    'JAK2 p.V617F') as boolean flags -- mostly lung/colorectal/melanoma/
+    myeloproliferative-associated events, not a breast-cancer subtype
+    classification at all. This function's premise does not apply to that
+    file, and running it against OmicsInferredMolecularSubtypes.csv will
+    just pick up an arbitrary hotspot-mutation column as if it were a
+    subtype label -- DO NOT use it for that file.
+
+    There is no confirmed DepMap file that re-derives a general TNBC/
+    subtype label independent of Model.csv's OncotreeSubtype/
+    ModelSubtypeFeatures columns (which is what your original TNBC
+    cell-line list was already built from) -- so that remains your
+    single source of truth for TNBC classification, without an
+    independent second file to cross-check it against.
+
+    This function is left in place as a generic "does this wide,
+    one-hot-style matrix agree with my cell-line list" utility, usable
+    against a DIFFERENT file if one is identified later -- just not this
+    one.
     """
     df = pd.read_csv(csv_path, index_col=0)
     print(f"Columns found: {df.columns.tolist()}")

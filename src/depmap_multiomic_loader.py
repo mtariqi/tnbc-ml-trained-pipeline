@@ -61,16 +61,43 @@ def parse_depmap_wide_matrix(
     strip_id_suffix: bool = True,
 ) -> pd.DataFrame:
     """
-    Generic parser for any DepMap file shaped like CRISPRGeneEffect.csv:
-    rows = ModelID, columns = gene symbols (optionally with a '(EntrezID)'
-    suffix). Used as the shared implementation behind the specific
-    parse_depmap_expression() / parse_depmap_cnv() / parse_depmap_dependency()
-    wrappers below.
+    Generic parser for DepMap wide-format files. Handles TWO layouts,
+    auto-detected:
+
+    Layout A (CRISPRGeneEffect.csv, CRISPRGeneDependency.csv, expression,
+    CNV): rows = ModelID directly as the index, columns = gene symbols
+    (optionally '(EntrezID)' suffix).
+
+    Layout B (OmicsSomaticMutationsMatrixDamaging.csv/Hotspot.csv):
+    ModelID is a NAMED COLUMN, not the index -- the actual index is a
+    meaningless row number, and there are leading metadata columns
+    (SequencingID, ModelConditionID, IsDefaultEntryForModel,
+    IsDefaultEntryForMC) before the gene columns start. This was
+    confirmed against the real file (previously assumed to match Layout
+    A, which was wrong and would have silently indexed by row number).
+    When this layout is detected, rows are also filtered to
+    IsDefaultEntryForModel == 'Yes' if that column is present, to avoid
+    double-counting a model with multiple sequencing entries.
 
     Returns a tidy DataFrame: kinase_id, cell_line_id, <value_name>,
     plus a 'mean_<value_name>' column (averaged across cell_line_ids).
     """
-    df = pd.read_csv(csv_path, index_col=0)
+    raw = pd.read_csv(csv_path)
+
+    if "ModelID" in raw.columns:
+        # Layout B
+        if "IsDefaultEntryForModel" in raw.columns:
+            before = len(raw)
+            raw = raw[raw["IsDefaultEntryForModel"] == "Yes"]
+            if len(raw) < before:
+                print(f"Filtered to IsDefaultEntryForModel=='Yes': {before} -> {len(raw)} rows.")
+        df = raw.set_index("ModelID")
+        metadata_cols = [c for c in ("SequencingID", "ModelConditionID", "IsDefaultEntryForModel", "IsDefaultEntryForMC")
+                         if c in df.columns]
+        df = df.drop(columns=metadata_cols)
+    else:
+        # Layout A
+        df = raw.set_index(raw.columns[0])
 
     if cell_line_ids is not None:
         missing = set(cell_line_ids) - set(df.index)
@@ -103,8 +130,72 @@ def parse_depmap_wide_matrix(
 
 
 # =====================================================================
-# 2. SPECIFIC WRAPPERS
+# 1b. MUTATION MATRIX PARSER -- DIFFERENT STRUCTURE, CONFIRMED AGAINST REAL FILE
 # =====================================================================
+
+def parse_depmap_mutation_matrix(
+    csv_path: str,
+    genes: List[str],
+    cell_line_ids: Optional[List[str]] = None,
+    value_name: str = "mutation_flag",
+) -> pd.DataFrame:
+    """
+    Parser for OmicsSomaticMutationsMatrixDamaging.csv and
+    OmicsSomaticMutationsMatrixHotspot.csv specifically -- CONFIRMED to
+    have a DIFFERENT structure than CRISPRGeneEffect.csv/CRISPRGeneDependency.csv:
+
+        - 'ModelID' is a NAMED COLUMN, not the row index (the actual row
+          index is just a meaningless sequential integer).
+        - There are 4 other metadata columns before the gene columns start:
+          SequencingID, ModelConditionID, IsDefaultEntryForModel,
+          IsDefaultEntryForMC.
+        - A single ModelID can have MULTIPLE rows (repeat sequencing runs /
+          model conditions) -- IsDefaultEntryForModel marks which single
+          row is the canonical one to use ('Yes'/'No').
+
+    Using parse_depmap_wide_matrix() (built for the OTHER convention) on
+    this file would silently treat the metadata columns as genes and use
+    a meaningless integer as the cell-line identifier -- this function
+    exists specifically to avoid that.
+    """
+    df = pd.read_csv(csv_path)
+
+    if "ModelID" not in df.columns or "IsDefaultEntryForModel" not in df.columns:
+        raise ValueError(
+            "Expected 'ModelID' and 'IsDefaultEntryForModel' columns -- this file's format "
+            "may differ from what was confirmed. Run inspect_depmap_csv() and compare."
+        )
+
+    before = len(df)
+    df = df[df["IsDefaultEntryForModel"] == "Yes"]
+    print(f"Filtered to {len(df)}/{before} rows marked as the default entry per model "
+          f"(dropping duplicate/non-canonical sequencing runs).")
+
+    metadata_cols = {"SequencingID", "ModelID", "ModelConditionID", "IsDefaultEntryForModel", "IsDefaultEntryForMC"}
+    gene_col_lookup = {c.split(" (")[0]: c for c in df.columns if c not in metadata_cols}
+
+    if cell_line_ids is not None:
+        missing = set(cell_line_ids) - set(df["ModelID"])
+        if missing:
+            print(f"Warning: {len(missing)} requested cell lines not found in file, skipping them.")
+        df = df[df["ModelID"].isin(cell_line_ids)]
+
+    found_genes = [g for g in genes if g in gene_col_lookup]
+    missing_genes = [g for g in genes if g not in gene_col_lookup]
+    if missing_genes:
+        print(f"Warning: {len(missing_genes)} genes not found in {csv_path}: {missing_genes}")
+
+    sub = df[["ModelID"] + [gene_col_lookup[g] for g in found_genes]].copy()
+    sub.columns = ["cell_line_id"] + found_genes
+
+    tidy = sub.melt(id_vars="cell_line_id", var_name="kinase_id", value_name=value_name)
+    mean_col = f"mean_{value_name}"
+    means = tidy.groupby("kinase_id")[value_name].mean().rename(mean_col)
+    tidy = tidy.merge(means, on="kinase_id", how="left")
+    return tidy
+
+
+
 
 def parse_depmap_expression(csv_path: str, genes: List[str], cell_line_ids=None) -> pd.DataFrame:
     """OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv -- log2(TPM+1) expression."""
@@ -127,9 +218,10 @@ def parse_depmap_dependency(csv_path: str, genes: List[str], cell_line_ids=None)
 def parse_depmap_damaging_mutations(csv_path: str, genes: List[str], cell_line_ids=None) -> pd.DataFrame:
     """OmicsSomaticMutationsMatrixDamaging.csv -- binary (0/1) flag for
     whether each cell line carries a damaging mutation in each gene.
-    NOTE: column-naming convention for this file is less certain than the
-    others -- run inspect_depmap_csv() on it first."""
-    return parse_depmap_wide_matrix(csv_path, genes, cell_line_ids, value_name="damaging_mutation")
+    CONFIRMED structure: ModelID is a named column (not the row index),
+    with 4 metadata columns before the gene columns start, and possible
+    duplicate rows per model -- see parse_depmap_mutation_matrix()."""
+    return parse_depmap_mutation_matrix(csv_path, genes, cell_line_ids, value_name="damaging_mutation")
 
 
 def parse_depmap_subtype_matrix(csv_path: str, cell_line_ids: Optional[List[str]] = None) -> pd.DataFrame:
